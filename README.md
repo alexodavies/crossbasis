@@ -1,15 +1,13 @@
-# CrossBasis: Python DLNM Package
+# crossbasis
 
-A pure-Python implementation of Distributed Lag Non-linear Models (DLNMs) based on Gasparrini, Armstrong & Kenward (2010), *Statistics in Medicine*, 29:2224–2234.
+Python implementation of **Distributed Lag Non-linear Models (DLNMs)** based on
+Gasparrini, Armstrong & Kenward (2010), *Statistics in Medicine* 29:2224–2234.
 
-## Features
+DLNMs model simultaneously non-linear and delayed effects of an exposure
+(e.g. temperature) on an outcome (e.g. daily deaths) — the standard approach in
+environmental epidemiology.
 
-- **Clean sklearn-style API**: `CrossBasis` transformer + `CrossPred` high-level class
-- **User-supplied basis functions**: Expose both exposure and lag dimensions to custom callars, or use built-in natural cubic splines, B-splines, polynomials, and linear bases
-- **DataFrame-aware**: Full support for pandas Series and DataFrame inputs/outputs
-- **Explicit centering**: Required centering argument prevents silent reference-value errors
-- **Rich visualization**: 3D surfaces, lag-response slices, and cumulative effect curves
-- **R compatibility**: Numerical outputs match R's `dlnm` package
+![Exposure-lag-response surface](https://raw.githubusercontent.com/alexodavies/crossbasis/main/docs_3d.png)
 
 ## Installation
 
@@ -17,171 +15,132 @@ A pure-Python implementation of Distributed Lag Non-linear Models (DLNMs) based 
 pip install crossbasis
 ```
 
-## Quick Start
+## Quick start
 
 ```python
 import numpy as np
-import pandas as pd
+import statsmodels.api as sm
 from crossbasis import CrossPred
 
-# Create sample data
-temperature = np.random.randn(365) * 10 + 15  # daily temperature
-deaths = np.random.poisson(100, 365)           # daily deaths
+# Daily exposure and outcome (e.g. temperature and deaths)
+temperature = np.random.randn(365) * 10 + 15
+deaths = np.random.poisson(40, 365)
 
-# Fit DLNM
+# 1. Fit: returns the cross-basis matrix W for use in your GLM
 cp = CrossPred(
-    var_basis="ns", var_df=5,      # exposure: natural cubic spline, 5 df
-    lag_basis="ns", lag_df=4,      # lag: natural cubic spline, 4 df
-    max_lag=30,                     # up to 30 days of lag
+    var_basis="ns", var_df=5,   # exposure dimension: natural cubic spline
+    lag_basis="ns", lag_df=4,   # lag dimension: natural cubic spline
+    max_lag=21,                  # model effects up to 21 days after exposure
+    cen="median",                # reference value for relative risk
 )
-
-# Get cross-basis matrix for GLM
 W = cp.fit(temperature)
 
-# Fit your own GLM (here using statsmodels)
-import statsmodels.api as sm
+# 2. Fit a Poisson GLM (add any confounders alongside W)
+X = sm.add_constant(W)
+model = sm.GLM(deaths, X, family=sm.families.Poisson()).fit()
 
-y = sm.add_constant(np.column_stack([W, confounders]))  # add intercept and confounders
-model = sm.GLM(deaths, y, family=sm.families.Poisson()).fit()
+# 3. Predict the full exposure-lag-response surface
+result = cp.predict(model, at=np.arange(-5, 36))
 
-# Predict at specific temperatures
-result = cp.predict(
-    model,
-    at=np.arange(-5, 35),  # temperatures from -5 to 35°C
-    cen=20,                 # reference temperature 20°C
-)
-
-# Access predictions
-print(result.allRR)  # cumulative relative risk
-
-# Visualize
-result.plot_overall()                  # cumulative effect
-result.plot_slice(var=25)               # lag response at 25°C
-result.plot_slice(lag=7)                # exposure response at 7-day lag
-result.plot_3d()                        # 3D surface
+# 4. Visualise
+result.plot_overall()       # cumulative effect across all lags
+result.plot_slice(lag=0)    # exposure-response at lag 0
+result.plot_slice(var=30)   # lag-response at 30 °C
+result.plot_3d()            # full 3D surface
 ```
 
-## Documentation
-
-### Core Classes
-
-#### `CrossPred` (High-level API)
-
-Main entry point for users. Manages fitting and prediction.
+**Confounders in the model?** When you include extra terms (seasonal splines,
+day-of-week, etc.), extract only the cross-basis coefficients before calling
+`predict`:
 
 ```python
-cp = CrossPred(
-    var_basis="ns",           # "ns", "bs", "poly", "linear", or callable
-    var_df=5,                 # degrees of freedom for exposure basis
+n_cb = W.shape[1]
+result = cp.predict(
+    coef=model.params.values[1:n_cb + 1],
+    vcov=model.cov_params().values[1:n_cb + 1, 1:n_cb + 1],
+    at=np.arange(-5, 36),
+)
+```
+
+## Core API
+
+### `CrossPred` — high-level interface
+
+```python
+CrossPred(
+    var_basis="ns",      # "ns" | "bs" | "poly" | "linear" | callable
+    var_df=5,
     lag_basis="ns",
     lag_df=4,
-    max_lag=30,               # required
-    na_action="drop",         # handle lag padding: "drop", "fill_zero", "fill_mean", or number
-    cen="median",             # centering: float, "median", "mean", "minimum_risk"
+    max_lag=21,          # required
+    na_action="drop",    # "drop" | "fill_zero" | "fill_mean" | float
+    cen="median",        # float | "median" | "mean" | "minimum_risk"
 )
-
-# Fit and get cross-basis matrix for GLM
-W = cp.fit(exposure_data)
-
-# Predict relative risk
-result = cp.predict(model, at=exposure_values, cen=reference_value)
 ```
 
-#### `PredictionResult`
+| Method | Returns |
+| --- | --- |
+| `cp.fit(X)` | Cross-basis matrix `W` — include in your GLM design matrix |
+| `cp.predict(model, at=..., cen=...)` | `PredictionResult` |
+| `cp.predict(coef=..., vcov=..., at=...)` | `PredictionResult` (no statsmodels needed) |
 
-Returned by `predict()`. Contains predictions and plotting methods.
+### `PredictionResult`
+
+| Attribute | Shape | Description |
+| --- | --- | --- |
+| `matfit` | `(m, L+1)` | log-RR at each (exposure, lag) |
+| `matse` | `(m, L+1)` | SE of `matfit` |
+| `RR` / `RR_low` / `RR_high` | `(m, L+1)` | Relative risk with 95% CI |
+| `allfit` | `(m,)` | Cumulative log-RR over all lags |
+| `allRR` / `allRR_low` / `allRR_high` | `(m,)` | Cumulative RR with 95% CI |
 
 ```python
-# Access predictions
-result.matfit          # log-RR at each (exposure, lag)
-result.allfit          # cumulative log-RR
-result.RR              # exponentiated (relative risk scale)
-result.allRR           # cumulative relative risk
-
-# Plotting
-result.plot_3d()       # 3D surface
-result.plot_slice(var=20)   # lag-response at exposure=20
-result.plot_overall()  # cumulative effect
-
-# Export to DataFrame
-df = result.to_frame()  # long format for ggplot or other viz
+result.to_frame()           # long-format DataFrame (exposure, lag, logRR, se, RR, …)
+result.plot_overall()       # cumulative effect curve
+result.plot_slice(lag=7)    # exposure-response at a specific lag
+result.plot_slice(var=25)   # lag-response at a specific exposure value
+result.plot_3d()            # 3D surface
 ```
 
-#### `CrossBasis` (Power Users)
+### `CrossBasis` — power-user transformer
 
-Lower-level transformer if you need fine-grained control or want to use the cross-basis matrix outside statsmodels.
+Use this directly when you need the cross-basis matrix outside statsmodels
+(e.g. in scikit-learn, PyMC, or JAX).
 
 ```python
 from crossbasis import CrossBasis
 
-cb = CrossBasis(
-    var_basis="ns", var_df=5,
-    lag_basis="ns", lag_df=4,
-    max_lag=30,
-)
-
-# Fit and transform
-W = cb.fit_transform(exposure_data)
-
-# Use W in any regression framework
-# (statsmodels, sklearn, PyMC, etc.)
+cb = CrossBasis(var_basis="ns", var_df=5, lag_basis="ns", lag_df=4, max_lag=21)
+W = cb.fit_transform(exposure_data)   # (n, v_x * v_l) numpy array
 ```
 
-### Built-in Basis Functions
+### Custom basis functions
 
-- **`ns`** (default): Natural cubic spline, matching R's `splines::ns()`
-- **`bs`**: B-spline
-- **`poly`**: Orthogonal polynomial
-- **`linear`**: Linear term (single column)
-
-Or supply your own:
+Any callable that returns an `(n, df)` float64 array works:
 
 ```python
-def my_basis(x, df, **kwargs):
-    # x: input vector
-    # df: number of basis functions
-    # return: (n, df) float64 array, no NaNs/Infs
-    return basis_matrix
+def my_basis(x: np.ndarray, df: int, **kwargs) -> np.ndarray:
+    ...
 
-cp = CrossPred(var_basis=my_basis, var_df=3, ...)
+cp = CrossPred(var_basis=my_basis, var_df=3, lag_basis="ns", lag_df=3, max_lag=14)
 ```
 
-### Centering Parameter
+## Centering
 
-The `cen` argument controls the reference exposure value:
+All relative risks are expressed relative to a reference exposure value (`cen`).
 
-| Value | Behavior |
-|-------|----------|
-| `float` | Use that value as reference |
-| `"median"` (default) | Median of training exposure |
+| `cen=` | Behaviour |
+| --- | --- |
+| `float` | Fixed reference value |
+| `"median"` *(default)* | Median of training exposure |
 | `"mean"` | Mean of training exposure |
-| `"minimum_risk"` | Approximate minimum of cumulative effect (experimental) |
-
-## Dependencies
-
-Required:
-- `numpy>=1.24`
-- `scipy>=1.10`
-- `statsmodels>=0.14` (for fitting; not needed if you use coef/vcov directly)
-- `matplotlib>=3.7` (for plotting)
-- `pandas>=1.5` (for DataFrame support)
-
-Optional (dev):
-- `pytest`, `pytest-cov` (testing)
-- `rpy2` (R validation, if comparing against R's dlnm package)
-
-## Testing
-
-```bash
-pytest tests/
-```
-
-Tests cover basis functions, cross-basis matrix construction, and prediction output shapes and centering behavior.
+| `"minimum_risk"` | Approximate minimum of the cumulative RR curve *(experimental)* |
 
 ## References
 
-Gasparrini A, Armstrong B, Kenward MG (2010). Distributed lag non-linear models. *Statistics in Medicine* 29:2224–2234.
-https://doi.org/10.1002/sim.3940
+Gasparrini A, Armstrong B, Kenward MG (2010). Distributed lag non-linear models.
+*Statistics in Medicine* **29**:2224–2234.
+[doi:10.1002/sim.3940](https://doi.org/10.1002/sim.3940)
 
 ## License
 

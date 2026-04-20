@@ -32,7 +32,8 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/climate-health-ai/crossbasis"
+Repository = "https://github.com/alexodavies/crossbasis"
+"Bug Tracker" = "https://github.com/alexodavies/crossbasis/issues"
 
 [project.optional-dependencies]
 dev = [
