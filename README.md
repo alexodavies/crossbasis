@@ -1,5 +1,7 @@
 # crossbasis
 
+[![tests](https://github.com/alexodavies/crossbasis/actions/workflows/tests.yml/badge.svg)](https://github.com/alexodavies/crossbasis/actions/workflows/tests.yml)
+
 Python implementation of **Distributed Lag Non-linear Models (DLNMs)** based on
 Gasparrini, Armstrong & Kenward (2010), *Statistics in Medicine* 29:2224–2234.
 
