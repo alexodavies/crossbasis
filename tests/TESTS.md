@@ -183,9 +183,31 @@ All tests in this file require `rpy2` and a working R installation. The whole fi
 
 ### `TestNsBasisNumerical` — ns_basis vs R's `splines::ns()`
 
+Parametrized over `df` ∈ {3, 4, 5} and matching point counts.
+
 | Test | What we're checking |
 |------|---------------------|
-| `test_ns_values_match_r` | Column-wise RMSE (allowing sign flips and column reordering) between Python and R basis matrices is < 0.15; shapes match exactly. Skips if R/splines unavailable; fails if RMSE too high. |
+| `test_ns_values_match_r[3-15]` | Python `ns_basis(x, df=3)` matches R's `ns(x, df=3)` to `atol=1e-8` after sign-aligning each column |
+| `test_ns_values_match_r[4-20]` | Same check for `df=4` |
+| `test_ns_values_match_r[5-30]` | Same check for `df=5` |
+
+### `TestCrossBasisMatchesR` — W matrix vs R's `dlnm::crossbasis()`
+
+Parametrized over three basis/df/lag configurations; all use `na_action="drop"` so NaN pattern can also be verified.
+
+| Test | What we're checking |
+|------|---------------------|
+| `test_crossbasis_w_matches_r_dlnm[ns-3-3-5-ns]` | `ns×ns`, `var_df=3`, `lag_df=3`, `max_lag=5`: W shape, NaN pattern, and non-NaN values all match R to `rtol=1e-5` |
+| `test_crossbasis_w_matches_r_dlnm[ns-5-4-10-ns]` | `ns×ns`, `var_df=5`, `lag_df=4`, `max_lag=10`: larger df and lag window |
+| `test_crossbasis_w_matches_r_dlnm[bs-4-3-7-bs]` | `bs×ns`, `var_df=4`, `lag_df=3`, `max_lag=7`: B-spline exposure basis |
+
+### `TestCrosspredMatchesR` — end-to-end pipeline vs R's `crosspred()`
+
+Fits an identical Poisson GLM on the same data in Python (statsmodels) and R (glm), then compares predictions. Both exclude the first `max_lag` rows so the fitted observations are exactly the same set.
+
+| Test | What we're checking |
+|------|---------------------|
+| `test_allrr_and_matrr_match_r` | `allRR`, `allRR_low`, `allRR_high` match R's `allRRfit/low/high` to `rtol=2e-3`; per-lag `RR` matrix matches R's `matRRfit` to `rtol=1e-2` (looser because per-lag values accumulate more GLM solver noise than the cumulative summary) |
 
 ### `TestCrossBasisNumerical` — CrossBasis with a real GLM
 

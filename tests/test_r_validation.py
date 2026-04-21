@@ -26,34 +26,159 @@ import statsmodels.api as sm
 class TestNsBasisNumerical:
     """Numerically compare ns_basis to R's splines::ns()."""
 
-    def test_ns_values_match_r(self):
-        """ns_basis numerical values match R's splines::ns()."""
+    @pytest.mark.parametrize("df,n_pts", [(3, 15), (4, 20), (5, 30)])
+    def test_ns_values_match_r(self, df, n_pts):
+        """ns_basis matches R's splines::ns() to numerical precision."""
         try:
             r('library(splines)')
         except Exception as e:
             pytest.skip(f"R/splines not available: {e}")
 
-        x_np = np.linspace(0, 10, 15)
-        B_py = ns_basis(x_np, df=3)
+        x_np = np.linspace(0, 10, n_pts)
+        B_py = ns_basis(x_np, df=df)
 
         with localconverter(ro.default_converter + numpy2ri.converter):
-            x_r = np2r(x_np)
-            B_r_robj = r.ns(x_r, df=3)
-            B_r = np.asarray(B_r_robj)
+            ro.globalenv['x_ns'] = np2r(x_np)
+            ro.globalenv['df_ns'] = df
+            B_r = np.asarray(r('ns(x_ns, df=df_ns)'))
 
-            assert B_py.shape == B_r.shape
+        assert B_py.shape == B_r.shape, f"Shape mismatch df={df}: {B_py.shape} vs {B_r.shape}"
 
-            py_norm = B_py / (np.max(np.abs(B_py), axis=0) + 1e-10)
-            r_norm = B_r / (np.max(np.abs(B_r), axis=0) + 1e-10)
+        # Columns may have arbitrary sign flips relative to R; match each Python column
+        # to its R counterpart and verify exact numerical agreement after sign alignment.
+        used = set()
+        for j, py_col in enumerate(B_py.T):
+            best_err, best_sign, best_k = np.inf, 1, -1
+            for k, r_col in enumerate(B_r.T):
+                if k in used:
+                    continue
+                for sign in (1, -1):
+                    err = np.max(np.abs(py_col - sign * r_col))
+                    if err < best_err:
+                        best_err, best_sign, best_k = err, sign, k
+            used.add(best_k)
+            assert best_err < 1e-8, (
+                f"ns_basis col {j} does not match R col {best_k} (sign={best_sign}): "
+                f"max abs diff = {best_err:.2e}"
+            )
 
-            for py_col in py_norm.T:
-                best_rmse = float('inf')
-                for r_col in r_norm.T:
-                    rmse = np.sqrt(np.mean((py_col - r_col)**2))
-                    rmse_flip = np.sqrt(np.mean((py_col + r_col)**2))
-                    best_rmse = min(best_rmse, rmse, rmse_flip)
 
-                assert best_rmse < 0.15, f"Column RMSE {best_rmse} too high"
+class TestCrossBasisMatchesR:
+    """Validate CrossBasis W matrix matches R's dlnm::crossbasis() exactly."""
+
+    @pytest.mark.parametrize("var_basis,var_df,lag_df,max_lag,r_var_fun", [
+        ("ns", 3, 3,  5, "ns"),   # baseline
+        ("ns", 5, 4, 10, "ns"),   # larger df and max_lag
+        ("bs", 4, 3,  7, "bs"),   # B-spline exposure basis
+    ])
+    def test_crossbasis_w_matches_r_dlnm(self, var_basis, var_df, lag_df, max_lag, r_var_fun):
+        try:
+            r('library(dlnm)')
+        except Exception as e:
+            pytest.skip(f"R/dlnm not available: {e}")
+
+        np.random.seed(0)
+        x = np.random.uniform(0, 30, 80)
+
+        import warnings
+        cb = CrossBasis(
+            var_basis=var_basis, var_df=var_df,
+            lag_basis="ns", lag_df=lag_df,
+            max_lag=max_lag,
+            na_action="drop",
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            W_py = np.asarray(cb.fit_transform(x))
+
+        with localconverter(ro.default_converter + numpy2ri.converter):
+            ro.globalenv['x_r'] = np2r(x)
+            W_r = np.asarray(r(f"""
+                library(dlnm)
+                cb_r <- crossbasis(x_r, lag={max_lag},
+                    argvar=list(fun="{r_var_fun}", df={var_df}),
+                    arglag=list(fun="ns", df={lag_df}))
+                unclass(cb_r)
+            """))
+
+        assert W_py.shape == W_r.shape, (
+            f"Shape mismatch ({var_basis} df={var_df}, lag df={lag_df}, "
+            f"max_lag={max_lag}): {W_py.shape} vs {W_r.shape}"
+        )
+        np.testing.assert_array_equal(np.isnan(W_py), np.isnan(W_r),
+            err_msg="NaN pattern does not match R")
+        full_rows = ~np.isnan(W_r).any(axis=1)
+        np.testing.assert_allclose(
+            W_py[full_rows], W_r[full_rows], rtol=1e-5, atol=1e-8,
+            err_msg=f"W mismatch for {var_basis}×ns df={var_df}×{lag_df} max_lag={max_lag}",
+        )
+
+
+class TestCrosspredMatchesR:
+    """End-to-end validation: fit GLM + predict, compare allRR and matRR against R's crosspred()."""
+
+    def test_allrr_and_matrr_match_r(self):
+        try:
+            r('library(dlnm)')
+        except Exception as e:
+            pytest.skip(f"R/dlnm not available: {e}")
+
+        np.random.seed(42)
+        n = 100
+        x = np.random.uniform(0, 30, n)
+        y = np.random.poisson(20, n).astype(float)
+        at_vals = np.array([5.0, 15.0, 25.0])
+        cen_val = 15.0
+        var_df, lag_df, max_lag = 3, 3, 5
+
+        # --- Python ---
+        # Drop first max_lag rows (incomplete lag history) from both W and y so
+        # the GLM is fit on exactly the same observations as R.
+        import warnings
+        cp = CrossPred(
+            var_basis="ns", var_df=var_df,
+            lag_basis="ns", lag_df=lag_df,
+            max_lag=max_lag,
+            na_action="drop",
+            cen=cen_val,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            W_py = np.asarray(cp.fit(x))
+
+        complete = ~np.isnan(W_py).any(axis=1)
+        X_glm = sm.add_constant(W_py[complete])
+        model = sm.GLM(y[complete], X_glm, family=sm.families.Poisson()).fit()
+        result = cp.predict(model, at=at_vals, cen=cen_val)
+
+        # --- R ---
+        with localconverter(ro.default_converter + numpy2ri.converter):
+            ro.globalenv['x_r'] = np2r(x)
+            ro.globalenv['y_r'] = np2r(y)
+            ro.globalenv['at_r'] = np2r(at_vals)
+            r(f"""
+                library(dlnm)
+                cb_r <- crossbasis(x_r, lag={max_lag},
+                    argvar=list(fun="ns", df={var_df}),
+                    arglag=list(fun="ns", df={lag_df}))
+                # Fit on complete rows only (matching Python na_action="drop")
+                keep <- ({max_lag}+1):length(y_r)
+                mod_r <- glm(y_r[keep] ~ cb_r[keep,], family=poisson())
+                pred_r <- crosspred(cb_r, mod_r, at=at_r, cen={cen_val})
+            """)
+            allRRfit_r  = np.asarray(r('pred_r$allRRfit'))
+            allRRlow_r  = np.asarray(r('pred_r$allRRlow'))
+            allRRhigh_r = np.asarray(r('pred_r$allRRhigh'))
+            matRRfit_r  = np.asarray(r('pred_r$matRRfit'))
+
+        np.testing.assert_allclose(result.allRR,      allRRfit_r,  rtol=2e-3,
+            err_msg="allRR does not match R crosspred allRRfit")
+        np.testing.assert_allclose(result.allRR_low,  allRRlow_r,  rtol=2e-3,
+            err_msg="allRR_low does not match R crosspred allRRlow")
+        np.testing.assert_allclose(result.allRR_high, allRRhigh_r, rtol=2e-3,
+            err_msg="allRR_high does not match R crosspred allRRhigh")
+        np.testing.assert_allclose(result.RR, matRRfit_r, rtol=1e-2,
+            err_msg="RR matrix does not match R crosspred matRRfit")
 
 
 class TestCrossBasisNumerical:

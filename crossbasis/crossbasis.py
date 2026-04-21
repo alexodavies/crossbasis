@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from .basis import build_basis
-from .utils import to_array, build_lag_matrix, logknots, equalknots
+from .utils import to_array, logknots, equalknots
 
 
 class CrossBasis:
@@ -41,8 +41,8 @@ class CrossBasis:
         Additional arguments for lag basis function
     max_lag : int, required
         Maximum lag
-    lag_knot_scale : str, default "log"
-        Scale for automatic lag knot placement: "log" or "equal"
+    lag_knot_scale : str, default "equal"
+        Scale for automatic lag knot placement: "equal" or "log"
     na_action : str or float, default "drop"
         Strategy for NaN rows from lag padding: "drop", "fill_zero", "fill_mean", or numeric value
     """
@@ -58,7 +58,7 @@ class CrossBasis:
         lag_knots=None,
         lag_kwargs=None,
         max_lag=None,
-        lag_knot_scale="log",
+        lag_knot_scale="equal",
         na_action="drop",
     ):
         if max_lag is None:
@@ -77,7 +77,11 @@ class CrossBasis:
         self.lag_basis = lag_basis
         self.lag_df = lag_df
         self.lag_knots = lag_knots
-        self.lag_kwargs = lag_kwargs or {}
+        # R's crossbasis defaults to intercept=True for the lag basis
+        _lag_kwargs = lag_kwargs or {}
+        if 'intercept' not in _lag_kwargs:
+            _lag_kwargs = {'intercept': True, **_lag_kwargs}
+        self.lag_kwargs = _lag_kwargs
         self.max_lag = max_lag
         self.lag_knot_scale = lag_knot_scale
         self.na_action = na_action
@@ -94,7 +98,7 @@ class CrossBasis:
         else:
             # bs and others: df = n_interior + degree + int(intercept), degree defaults to 3
             degree = kwargs.get('degree', 3)
-            return max(0, df - degree - int(not intercept))
+            return max(0, df - degree - int(intercept))
 
     def fit(self, X):
         """
@@ -173,32 +177,6 @@ class CrossBasis:
         X_arr = to_array(X)
         is_dataframe = isinstance(X, (pd.DataFrame, pd.Series))
 
-        # Build lag matrix Q
-        Q = build_lag_matrix(X_arr, self.max_lag)
-
-        # Handle NaN rows from lag padding
-        nan_mask = np.isnan(Q).any(axis=1)
-        nan_indices = np.where(nan_mask)[0]
-
-        if self.na_action == "drop":
-            if nan_indices.size > 0:
-                warnings.warn(
-                    f"CrossBasis.transform: {len(nan_indices)} rows with NaNs from lag padding "
-                    f"(first {min(5, len(nan_indices))} row indices: {nan_indices[:5]}). "
-                    f"These rows will produce NaN in W.",
-                    UserWarning,
-                )
-        elif self.na_action == "fill_zero":
-            Q = np.nan_to_num(Q, nan=0.0)
-        elif self.na_action == "fill_mean":
-            col_means = np.nanmean(Q, axis=0)
-            for i in range(Q.shape[1]):
-                Q[np.isnan(Q[:, i]), i] = col_means[i]
-        elif isinstance(self.na_action, (int, float)):
-            Q = np.nan_to_num(Q, nan=float(self.na_action))
-        else:
-            raise ValueError(f"Invalid na_action: {self.na_action}")
-
         # Build exposure basis Z
         z_kwargs = dict(boundary_knots=self.boundary_knots_, **self.var_kwargs)
         if self.var_knots_ is not None:
@@ -214,17 +192,45 @@ class CrossBasis:
 
         # Store for later use in CrossPred
         self.C_ = C
-        self.Z_shape_ = Z.shape[1]  # Store v_x
-
-        # Compute W: row-wise Kronecker product of Z and (Q @ C)
-        QC = Q @ C
-        n = Z.shape[0]
-        v_x = Z.shape[1]
+        self.Z_shape_ = Z.shape[1]  # v_x
+        n, v_x = Z.shape
         v_l = C.shape[1]
-        W = np.zeros((n, v_x * v_l), dtype=np.float64)
+        L = self.max_lag
 
-        for t in range(n):
-            W[t, :] = np.kron(Z[t, :], QC[t, :])
+        # Build Z_lagged[t, ℓ, j] = b_j(x_{t-ℓ})  — Gasparrini 2010, Eq. 8
+        # Lag the already-transformed basis variables (not raw X).
+        Z_lagged = np.full((n, L + 1, v_x), np.nan, dtype=np.float64)
+        Z_lagged[:, 0, :] = Z
+        for ell in range(1, L + 1):
+            Z_lagged[ell:, ell, :] = Z[:-ell, :]
+
+        # NaN handling
+        nan_mask = np.isnan(Z_lagged).any(axis=(1, 2))
+        nan_indices = np.where(nan_mask)[0]
+
+        if self.na_action == "drop":
+            if nan_indices.size > 0:
+                warnings.warn(
+                    f"CrossBasis.transform: {len(nan_indices)} rows with NaNs from lag padding "
+                    f"(first {min(5, len(nan_indices))} row indices: {nan_indices[:5]}). "
+                    f"These rows will produce NaN in W.",
+                    UserWarning,
+                )
+        elif self.na_action == "fill_zero":
+            Z_lagged = np.nan_to_num(Z_lagged, nan=0.0)
+        elif self.na_action == "fill_mean":
+            for ell in range(L + 1):
+                for j in range(v_x):
+                    col = Z_lagged[:, ell, j]
+                    mean_val = np.nanmean(col)
+                    Z_lagged[np.isnan(col), ell, j] = mean_val
+        elif isinstance(self.na_action, (int, float)):
+            Z_lagged = np.nan_to_num(Z_lagged, nan=float(self.na_action))
+        else:
+            raise ValueError(f"Invalid na_action: {self.na_action}")
+
+        # W[t, j*v_l+k] = Σ_ℓ Z_lagged[t, ℓ, j] * C[ℓ, k]  (Eq. 8)
+        W = np.einsum('tlj,lk->tjk', Z_lagged, C).reshape(n, v_x * v_l)
 
         # Apply NaN to dropped rows if na_action="drop"
         if self.na_action == "drop" and nan_indices.size > 0:
